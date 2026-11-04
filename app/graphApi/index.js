@@ -438,6 +438,80 @@ class GraphApiClient {
     }
   }
 
+  /**
+   * Report which delegated scopes the borrowed Teams token carries, without
+   * exposing the token. The token belongs to Microsoft's first-party Teams
+   * client, so its scope set is fixed and decides which endpoints work.
+   */
+  async getTokenInfo() {
+    const tokenResult = await this.acquireToken();
+    if (!tokenResult.success || !tokenResult.token) {
+      return { success: false, error: tokenResult.error || 'Failed to acquire token' };
+    }
+    try {
+      const payload = JSON.parse(Buffer.from(tokenResult.token.split('.')[1], 'base64url').toString('utf8'));
+      return {
+        success: true,
+        data: {
+          scopes: (payload.scp || '').split(' ').filter(Boolean).sort(),
+          expiry: tokenResult.expiry,
+        },
+      };
+    } catch (error) {
+      return { success: false, error: `Could not decode token: ${error.message}` };
+    }
+  }
+
+  /** List the teams the signed-in user is a member of */
+  async getJoinedTeams() {
+    return await this.makeRequest('/me/joinedTeams?$select=id,displayName');
+  }
+
+  /** List the channels of a team */
+  async getTeamChannels(teamId) {
+    return await this.makeRequest(
+      `/teams/${encodeURIComponent(teamId)}/channels?$select=id,displayName,membershipType`
+    );
+  }
+
+  /** List the most recent top-level messages of a channel */
+  async getChannelMessages(teamId, channelId, top = 20) {
+    return await this.makeRequest(
+      `/teams/${encodeURIComponent(teamId)}/channels/${encodeURIComponent(channelId)}/messages?$top=${Number(top) || 20}`
+    );
+  }
+
+  /** List the replies to a channel message */
+  async getChannelMessageReplies(teamId, channelId, messageId, top = 50) {
+    return await this.makeRequest(
+      `/teams/${encodeURIComponent(teamId)}/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(messageId)}/replies?$top=${Number(top) || 50}`
+    );
+  }
+
+  /** Post a new top-level message to a channel, or a reply when replyToId is given */
+  async sendChannelMessage(teamId, channelId, content, replyToId = null) {
+    const base = `/teams/${encodeURIComponent(teamId)}/channels/${encodeURIComponent(channelId)}/messages`;
+    const endpoint = replyToId ? `${base}/${encodeURIComponent(replyToId)}/replies` : base;
+    return await this.makeRequest(endpoint, {
+      method: 'POST',
+      body: { body: { content, contentType: 'text' } },
+    });
+  }
+
+  /** List the user's chats, most recently active first, with their last message preview */
+  async getChats(top = 30) {
+    return await this.makeRequest(
+      `/me/chats?$expand=members,lastMessagePreview&$orderby=lastMessagePreview/createdDateTime desc&$top=${Number(top) || 30}`
+    );
+  }
+
+  /** List the most recent messages of a chat, newest first */
+  async getChatMessages(chatId, top = 20) {
+    return await this.makeRequest(
+      `/chats/${encodeURIComponent(chatId)}/messages?$top=${Number(top) || 20}&$orderby=createdDateTime desc`
+    );
+  }
+
   /** Send a chat message to a user (orchestrates resolve + send) */
   async sendChatMessageToUser(contactInfo, content) {
     try {

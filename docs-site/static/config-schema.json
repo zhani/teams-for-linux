@@ -1,7 +1,7 @@
 {
   "$generatedBy": "scripts/generateConfigDocs.js",
   "source": "app/config/options.js",
-  "optionCount": 85,
+  "optionCount": 86,
   "options": [
     {
       "name": "dbusControl",
@@ -1252,6 +1252,23 @@
           "type": "boolean",
           "default": false,
           "description": "Enable the Microsoft Graph API integration for calendar and mail access."
+        }
+      ]
+    },
+    {
+      "name": "terminalApi",
+      "type": "object",
+      "default": {
+        "enabled": false
+      },
+      "description": "Local terminal API for reading and posting Teams channel and chat messages from a terminal (app/terminalApi/cli.js), e.g. while the app runs headless under Xvfb. Listens on a user-only Unix socket in $XDG_RUNTIME_DIR and also reports the sign-in MFA number-matching code. Requires graphApi.enabled.",
+      "applyMode": "restart",
+      "fields": [
+        {
+          "path": "enabled",
+          "type": "boolean",
+          "default": false,
+          "description": "Enable the local terminal API socket. Requires graphApi.enabled."
         }
       ]
     },

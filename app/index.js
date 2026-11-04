@@ -16,6 +16,7 @@ const MQTTMediaStatusService = require("./mqtt/mediaStatusService");
 const HomeAssistantDiscovery = require("./mqtt/homeAssistantDiscovery");
 const GraphApiClient = require("./graphApi");
 const { registerGraphApiHandlers } = require("./graphApi/ipcHandlers");
+const { TerminalApiServer } = require("./terminalApi");
 const { allowedChannels } = require("./security/ipcValidator");
 const { installIpcSecurity } = require("./security/ipcSecurity");
 const { installWebviewGuard } = require("./security/webviewGuard");
@@ -144,6 +145,7 @@ let mqttClient = null;
 let mqttMediaStatusService = null;
 let haDiscovery = null;
 let graphApiClient = null;
+let terminalApiServer = null;
 let teamsStateService = null;
 let teamsControlService = null;
 let quickChatManager = null;
@@ -244,6 +246,7 @@ if (gotTheLock) {
     console.debug("will-quit");
     teamsStateService?.dispose();
     teamsControlService?.dispose();
+    terminalApiServer?.dispose();
     try {
       dbusControlService?.stop();
     } catch (error) {
@@ -665,6 +668,22 @@ function initializeGraphApiClient() {
   }
 }
 
+async function initializeTerminalApi() {
+  if (!config.terminalApi?.enabled) return;
+  if (!graphApiClient) {
+    console.warn("[TERMINAL_API] terminalApi.enabled requires graphApi.enabled; not starting");
+    return;
+  }
+  try {
+    terminalApiServer = new TerminalApiServer(config, graphApiClient);
+    await terminalApiServer.start();
+    terminalApiServer.watchLogins();
+  } catch (error) {
+    console.error("[TERMINAL_API] Failed to start", { code: error.code, message: error.message });
+    terminalApiServer = null;
+  }
+}
+
 function initializeQuickChat() {
   const mainWindow = mainAppWindow.getWindow();
   if (!mainWindow) return;
@@ -805,6 +824,7 @@ async function handleAppReady() {
 
     initializeGraphApiClient();
     registerGraphApiHandlers(ipcMain, graphApiClient);
+    await initializeTerminalApi();
     if (teamsControlService && config.multiAccount?.enabled) {
       profilesManager.on("switch", () => setImmediate(() => teamsControlService.refreshState()));
     }

@@ -65,6 +65,11 @@ currently wired to an IPC channel.
 - `GET /chats/{id}/members`, `POST /chats/{id}/messages` — used by `resolveConversation` /
   `sendChatMessage` for Quick Chat inline messaging (see
   [ADR-015](../../docs-site/docs/development/adr/015-quick-chat-inline-messaging.md))
+- `GET /me/joinedTeams`, `GET /teams/{id}/channels`, `GET`/`POST /teams/{id}/channels/{id}/messages`
+  (and `.../{messageId}/replies`), `GET /me/chats`, `GET /chats/{id}/messages`. These are used only by
+  the local [terminal API](../terminalApi/README.md), not by any IPC channel.
+- `getTokenInfo()` decodes the delegated scopes (`scp`) of the borrowed token without returning the
+  token, so you can see which endpoints the Teams first-party token permits.
 
 ## OData Query Support
 

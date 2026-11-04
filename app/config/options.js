@@ -1106,6 +1106,21 @@ module.exports = {
         },
         applyMode: "restart",
       },
+      terminalApi: {
+        default: {
+          enabled: false,
+        },
+        describe: "Local terminal API for reading and posting Teams channel and chat messages from a terminal (app/terminalApi/cli.js), e.g. while the app runs headless under Xvfb. Listens on a user-only Unix socket in $XDG_RUNTIME_DIR and also reports the sign-in MFA number-matching code. Requires graphApi.enabled.",
+        type: "object",
+        fields: {
+          "enabled": {
+            type: "boolean",
+            describe:
+              "Enable the local terminal API socket. Requires graphApi.enabled.",
+          },
+        },
+        applyMode: "restart",
+      },
       auth: {
         default: {
           intune: {
