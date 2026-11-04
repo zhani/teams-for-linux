@@ -19,10 +19,18 @@ const path = require("node:path");
 const { app, webContents } = require("electron");
 const { isLoginUrl } = require("../ssoPasswordPrefill");
 const { ChatServiceClient } = require("./chatService");
+const { buildLoginStepScript } = require("./loginDriver");
 
 const SOCKET_NAME = "teams-for-linux-terminal.sock";
 const MFA_WAIT_MS = 120000;
 const MAX_LINE_BYTES = 1024 * 1024;
+const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
+const LOGIN_STEP_MS = 1500;
+// A fresh start may still be loading Teams; wait this long for a sign-in
+// page before concluding the session is already signed in.
+const LOGIN_APPEAR_MS = 20000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Runs in the login page's frame. Resolves with the number-matching code once
 // Microsoft renders it, or null after the timeout.
@@ -43,6 +51,8 @@ const MFA_CODE_SCRIPT = `(() => new Promise((resolve) => {
 }))()`;
 
 function defaultSocketPath() {
+  // Lets a second instance (e.g. a throwaway test profile) use its own socket.
+  if (process.env.TEAMS_CLI_SOCKET) return process.env.TEAMS_CLI_SOCKET;
   const dir = process.env.XDG_RUNTIME_DIR || app.getPath("userData");
   return path.join(dir, SOCKET_NAME);
 }
@@ -75,7 +85,9 @@ class TerminalApiServer {
   #subscribers = new Set();
   #teamsCache = null;
   #channelsCache = new Map();
-  #loginContents = new Set();
+  #loginContents = new Map(); // webContents id -> webContents showing sign-in
+  #loginRunning = false;
+  #lastMfa = { code: null, at: 0 };
   #pendingMfaFrames = new WeakSet();
 
   constructor(config, graphApiClient, { socketPath, chatService } = {}) {
@@ -92,6 +104,9 @@ class TerminalApiServer {
   }
 
   async start() {
+    if (await this.#socketInUse()) {
+      throw new Error("Terminal API socket is in use by another instance; set TEAMS_CLI_SOCKET to use a different one");
+    }
     this.#removeStaleSocket();
     this.#server = net.createServer((socket) => this.#onConnection(socket));
     await new Promise((resolve, reject) => {
@@ -128,18 +143,18 @@ class TerminalApiServer {
         // only a top-level login page counts as "sign-in needed".
         const topIsLogin = loginFrames.includes(wc.mainFrame);
         if (topIsLogin && !this.#loginContents.has(wcId)) {
-          this.#loginContents.add(wcId);
+          this.#loginContents.set(wcId, wc);
           console.info("[TERMINAL_API] Sign-in page shown");
           this.#broadcast({ event: "login-required" });
         } else if (!topIsLogin) {
-          this.#loginContents.delete(wcId);
+          this.#leaveLogin(wcId);
         }
         for (const frame of loginFrames) this.#watchMfaFrame(frame);
       };
       wc.on("dom-ready", check);
       wc.on("did-navigate", check);
       wc.on("did-frame-navigate", check);
-      wc.once("destroyed", () => this.#loginContents.delete(wcId));
+      wc.once("destroyed", () => this.#leaveLogin(wcId));
       check();
     };
     // The main window already exists when this module starts, so cover it too.
@@ -147,15 +162,30 @@ class TerminalApiServer {
     app.on("web-contents-created", (_event, wc) => attach(wc));
   }
 
+  // Both the page watcher and the login loop see the same code repeatedly
+  // while it waits for approval; report each code once.
+  #reportMfaCode(code) {
+    const now = Date.now();
+    if (code === this.#lastMfa.code && now - this.#lastMfa.at < MFA_WAIT_MS) return;
+    this.#lastMfa = { code, at: now };
+    console.info(`[TERMINAL_API] Approve sign-in on your phone: ${code}`);
+    this.#broadcast({ event: "mfa-code", code });
+  }
+
+  #leaveLogin(wcId) {
+    if (!this.#loginContents.delete(wcId)) return;
+    if (this.#loginContents.size === 0) {
+      console.info("[TERMINAL_API] Sign-in page closed");
+      this.#broadcast({ event: "login-complete" });
+    }
+  }
+
   async #watchMfaFrame(frame) {
     if (this.#pendingMfaFrames.has(frame)) return;
     this.#pendingMfaFrames.add(frame);
     try {
       const code = await frame.executeJavaScript(MFA_CODE_SCRIPT, true);
-      if (code) {
-        console.info(`[TERMINAL_API] Approve sign-in on your phone: ${code}`);
-        this.#broadcast({ event: "mfa-code", code });
-      }
+      if (code) this.#reportMfaCode(code);
     } catch {
       // Frame navigated away or was destroyed; the next navigation re-checks.
     } finally {
@@ -169,6 +199,17 @@ class TerminalApiServer {
     this.#server?.close();
     this.#server = null;
     this.#removeStaleSocket();
+  }
+
+  #socketInUse() {
+    return new Promise((resolve) => {
+      const probe = net.createConnection(this.#socketPath);
+      probe.once("connect", () => {
+        probe.destroy();
+        resolve(true);
+      });
+      probe.once("error", () => resolve(false));
+    });
   }
 
   #removeStaleSocket() {
@@ -264,6 +305,10 @@ class TerminalApiServer {
         return this.#unwrap(await this.#chats.getChats(params.top));
       case "chatMessages":
         return this.#unwrap(await this.#chats.getChatMessages(this.#required(params, "chatId"), params.top));
+      case "login":
+        return await this.#login(params, socket);
+      case "screenshot":
+        return await this.#screenshot();
       case "chatSend":
         return this.#unwrap(
           await this.#graph.sendChatMessage(this.#required(params, "chatId"), this.#required(params, "text"))
@@ -271,6 +316,75 @@ class TerminalApiServer {
       default:
         throw new Error(`Unknown method: ${method}`);
     }
+  }
+
+  /**
+   * Step through the web sign-in on behalf of a terminal user. Progress goes
+   * to the requesting socket as {event:'login-progress'}; the password is
+   * only typed into the sign-in page and never logged or broadcast.
+   */
+  async #login(params, socket) {
+    if (this.#loginRunning) throw new Error("A login is already in progress");
+    this.#loginRunning = true;
+    const user = params.user || this.#config.auth?.webLogin?.user || null;
+    const password = params.password || null;
+    const prefillPassword = !!this.#config.auth?.webLogin?.passwordCommand;
+    const started = Date.now();
+    let sawLogin = false;
+    let last = null;
+    const progress = (step) => {
+      const key = JSON.stringify(step);
+      if (key === last || socket.destroyed) return;
+      last = key;
+      socket.write(JSON.stringify({ event: "login-progress", ...step }) + "\n");
+    };
+    try {
+      while (Date.now() - started < LOGIN_TIMEOUT_MS) {
+        const wc = [...this.#loginContents.values()].find((w) => !w.isDestroyed());
+        if (!wc) {
+          if (sawLogin) return { signedIn: true };
+          if (Date.now() - started > LOGIN_APPEAR_MS) return { signedIn: true, alreadySignedIn: true };
+          progress({ state: "waiting-for-sign-in-page" });
+          await sleep(LOGIN_STEP_MS);
+          continue;
+        }
+        sawLogin = true;
+        const step = await wc.mainFrame
+          .executeJavaScript(buildLoginStepScript({ user, password }), true)
+          .catch(() => ({ state: "loading" }));
+        switch (step?.state) {
+          case "email":
+            throw new Error("The sign-in page asks for an email: run `teams-cli login <email>`");
+          case "password":
+            if (!prefillPassword) throw new Error("The sign-in page asks for a password but none was given");
+            break; // auth.webLogin.passwordCommand fills it
+          case "error":
+            throw new Error(`Sign-in page reports: ${step.error}`);
+          case "otc-unsupported":
+            throw new Error("The sign-in asks for a one-time code; switch MFA to Authenticator approval or sign in via VNC");
+          case "mfa":
+            this.#reportMfaCode(step.code);
+            break;
+          default:
+            break;
+        }
+        progress(step || { state: "loading" });
+        await sleep(LOGIN_STEP_MS);
+      }
+      throw new Error("Sign-in did not finish within 5 minutes");
+    } finally {
+      this.#loginRunning = false;
+    }
+  }
+
+  /** PNG of the sign-in window if one is open, else the main window. */
+  async #screenshot() {
+    const wc =
+      [...this.#loginContents.values()].find((w) => !w.isDestroyed()) ||
+      this.#graph.mainWindow?.webContents;
+    if (!wc || wc.isDestroyed()) throw new Error("No window to capture");
+    const image = await wc.capturePage();
+    return { png: image.toPNG().toString("base64"), url: wc.getURL().split("?")[0] };
   }
 
   #required(params, key) {

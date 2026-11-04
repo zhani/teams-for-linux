@@ -6,6 +6,8 @@
 const net = require("node:net");
 const path = require("node:path");
 const os = require("node:os");
+const fs = require("node:fs");
+const readline = require("node:readline");
 
 const SOCKET_NAME = "teams-for-linux-terminal.sock";
 const WATCH_POLL_MS = 30000;
@@ -23,6 +25,8 @@ const USAGE = `Usage: teams-cli <command> [args]
   chat <chatId|#> [-n N]              Show recent chat messages
   send <chatId|#> <text|->            Send a chat message
   watch                               Print sign-in/MFA events and new chat messages
+  login [email]                       Sign in from the terminal (prompts for the password)
+  screenshot [file.png]               Save an image of the (headless) window
 
 Socket: $TEAMS_CLI_SOCKET, else $XDG_RUNTIME_DIR/${SOCKET_NAME}`;
 
@@ -112,6 +116,70 @@ async function readText(arg) {
   return data.trimEnd();
 }
 
+function ask(question) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => rl.question(question, (answer) => {
+    rl.close();
+    resolve(answer.trim());
+  }));
+}
+
+// Reads a line without echoing it, so the password never shows on screen.
+function askHidden(question) {
+  if (!process.stdin.isTTY) return ask(question);
+  process.stdout.write(question);
+  return new Promise((resolve) => {
+    let value = "";
+    const finish = () => {
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      process.stdin.off("data", onData);
+      process.stdout.write("\n");
+      resolve(value);
+    };
+    const onData = (chunk) => {
+      for (const ch of chunk) {
+        if (ch === "\r" || ch === "\n") return finish();
+        if (ch === "\u0003") {
+          process.stdin.setRawMode(false);
+          process.stdout.write("\n");
+          process.exit(130);
+        }
+        if (ch === "\u007f" || ch === "\b") value = value.slice(0, -1);
+        else value += ch;
+      }
+    };
+    process.stdin.setRawMode(true);
+    process.stdin.setEncoding("utf8");
+    process.stdin.resume();
+    process.stdin.on("data", onData);
+  });
+}
+
+const LOGIN_MESSAGES = {
+  "waiting-for-sign-in-page": "Waiting for the sign-in page...",
+  "email-submitted": "Email entered.",
+  "password-submitted": "Password entered.",
+  "account-picked": "Account selected.",
+  "account-other": "Choosing 'Use another account'.",
+  "mfa-wait": "Waiting for you to approve the sign-in on your phone...",
+  "kmsi-accepted": "Answered 'Stay signed in?' with Yes.",
+  password: "Waiting for auth.webLogin.passwordCommand to fill the password...",
+};
+
+async function login(client, email) {
+  const user = email || (await ask("Email: "));
+  const password = await askHidden("Password: ");
+  client.onEvent((e) => {
+    if (e.event !== "login-progress") return;
+    if (e.state === "mfa") console.log(`*** Approve the sign-in in Microsoft Authenticator: ${e.code}`);
+    else if (e.state === "unknown") console.log(`(sign-in page: ${e.title || "unrecognised step"}; try 'screenshot')`);
+    else if (LOGIN_MESSAGES[e.state]) console.log(LOGIN_MESSAGES[e.state]);
+  });
+  const result = await client.call("login", { user, password });
+  console.log(result.alreadySignedIn ? "No sign-in page appeared: already signed in." : "Signed in.");
+}
+
 const fmtTime = (iso) => (iso ? new Date(iso).toLocaleString() : "");
 const sender = (m) => m.from?.user?.displayName || m.from?.application?.displayName || "system";
 
@@ -151,6 +219,7 @@ async function watch(client) {
   client.onEvent((e) => {
     if (e.event === "login-required") console.log("*** Sign-in page shown in teams-for-linux");
     if (e.event === "mfa-code") console.log(`*** Approve the sign-in in Microsoft Authenticator: ${e.code}`);
+    if (e.event === "login-complete") console.log("*** Sign-in page closed");
   });
   await client.call("subscribe");
   console.log("Watching (Ctrl-C to stop)...");
@@ -245,6 +314,17 @@ async function main(argv) {
         const chatId = await resolveChat(client, args[0]);
         await client.call("chatSend", { chatId, text: await readText(args.slice(1).join(" ")) });
         console.log("Sent.");
+        break;
+      }
+      case "login":
+        await login(client, args[0]);
+        break;
+      case "screenshot": {
+        const file = args[0] || "teams-screenshot.png";
+        const { png, url } = await client.call("screenshot");
+        // The window can show private messages; keep the file owner-only.
+        fs.writeFileSync(file, Buffer.from(png, "base64"), { mode: 0o600 });
+        console.log(`Saved ${file} (${url})`);
         break;
       }
       case "watch":

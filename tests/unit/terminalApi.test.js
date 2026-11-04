@@ -173,3 +173,37 @@ describe('chatService normalisation', () => {
 		assert.equal(isChatConversation({ id: '48:notifications' }), false);
 	});
 });
+
+describe('TerminalApiServer socket ownership', () => {
+	it('refuses to take over a socket another instance is serving, and honours TEAMS_CLI_SOCKET', async () => {
+		const { TerminalApiServer } = loadModule();
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tfl-own-'));
+		const socketPath = path.join(dir, 'api.sock');
+		const previous = process.env.TEAMS_CLI_SOCKET;
+		process.env.TEAMS_CLI_SOCKET = socketPath;
+		const first = new TerminalApiServer({}, fakeGraph(), { chatService: {} });
+		try {
+			assert.equal(first.socketPath, socketPath);
+			await first.start();
+			const second = new TerminalApiServer({}, fakeGraph(), { chatService: {} });
+			await assert.rejects(second.start(), /in use by another instance/);
+			assert.equal(fs.existsSync(socketPath), true);
+		} finally {
+			first.dispose();
+			if (previous === undefined) delete process.env.TEAMS_CLI_SOCKET;
+			else process.env.TEAMS_CLI_SOCKET = previous;
+			fs.rmSync(dir, { recursive: true, force: true });
+			delete require.cache[electronPath];
+		}
+	});
+});
+
+describe('loginDriver', () => {
+	const { buildLoginStepScript } = require('../../app/terminalApi/loginDriver');
+
+	it('embeds credentials as JSON literals so quotes cannot break the script', () => {
+		const script = buildLoginStepScript({ user: 'a@b.c', password: `p'"\`\${x}` });
+		assert.ok(script.includes(JSON.stringify(`p'"\`\${x}`)));
+		assert.doesNotThrow(() => new Function(`return ${script}`));
+	});
+});

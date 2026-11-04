@@ -104,10 +104,40 @@ teams-cli chats
 teams-cli chat 1 -n 20                   # '#'-index from `chats`, or a chat id
 teams-cli send 1 "On my way"
 teams-cli watch                          # sign-in/MFA events and new chat messages
+teams-cli login you@example.com          # sign in headless; prompts for the password
+teams-cli screenshot /tmp/teams.png      # image of the invisible window, for debugging
 ```
 
 Names in `Team/Channel` are matched case-insensitively. An exact name wins; otherwise a unique
 prefix is accepted.
+
+## Signing in headless
+
+When the session expires, the app shows the Microsoft sign-in page on the invisible display.
+`teams-cli login <email>` asks for your password without echoing it. It then works through the
+pages with `loginDriver.js`: email, password, account picker, number-matching MFA and "Stay signed
+in?". Each page is acted on at most once. It prints the two-digit number for you to enter in
+Microsoft Authenticator. The password is only typed into the sign-in page; it is never logged or
+saved.
+
+- A password the page rejects is never typed again, because repeated failures can lock the
+  account.
+- One-time-code MFA (SMS or an authenticator code) is not supported. Use Authenticator approval,
+  or sign in over VNC.
+- If it stops on an unrecognised page, run `teams-cli screenshot` to see what is showing.
+  Federated company sign-in pages are not handled.
+- The signed-in session lives in the profile directory and survives restarts.
+
+To test the flow without touching your real session, run a second instance with its own profile
+and socket:
+
+```sh
+E2E_USER_DATA_DIR=/tmp/tfl-test TEAMS_CLI_SOCKET=/tmp/tfl-test.sock npm run start:headless
+TEAMS_CLI_SOCKET=/tmp/tfl-test.sock teams-cli login you@example.com
+```
+
+`/tmp/tfl-test/config.json` needs `graphApi.enabled` and `terminalApi.enabled` set to `true`. The
+server will not start on a socket that another instance is still serving.
 
 ## Limitations
 
