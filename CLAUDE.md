@@ -274,6 +274,24 @@ When a PR has review comments, address them proactively:
 - `gh run list` is often refused by the permission classifier; `gh api repos/{owner}/{repo}/actions/runs` works
 - A merged release-please PR produces a **draft** release (`releaseType: draft` in `package.json`). It is published by hand, ships as a pre-release, and `releases/latest` keeps pointing at the previous version until it is promoted
 
+## Terminal API and Headless Mode
+
+`app/terminalApi/` lets a terminal CLI read and post Teams channel and chat messages while the app runs headless. See `app/terminalApi/README.md` for usage and setup.
+
+**Running it:**
+- `npm start` and `npm run start:headless` keep their data, including `config.json`, in `~/.config/Electron`, not `~/.config/teams-for-linux` (that one is used by the packaged app). The feature needs `graphApi.enabled` and `terminalApi.enabled` set to `true` in the right file.
+- On a Wayland desktop, `xvfb-run` alone still shows a window. `start:headless` therefore unsets `WAYLAND_DISPLAY`, sets `XDG_SESSION_TYPE=x11` and passes `--ozone-platform=x11`. Keep these in any systemd unit too.
+- The CLI (`node app/terminalApi/cli.js <command>`) only works while the app is running. Code changes in `app/terminalApi/index.js` or `chatService.js` need an app restart; changes in `cli.js` take effect immediately.
+
+**What the borrowed token allows:**
+- The Graph token from the Teams session has the channel permissions (`ChannelMessage.Read.All`, `ChannelMessage.Send`) and `ChatMessage.Send`, but no `Chat.Read`. Graph returns 403 for reading chats.
+- So chats are read through Teams' internal chat service (`chatService.js`, IC3 `chatsvc`), while chat messages are sent through Graph. Don't move sending to `chatsvc`: ADR-015 found those messages don't arrive reliably.
+- Check the current permissions with `cli.js status` before relying on another Graph endpoint.
+
+**Testing:**
+- Unit tests fake the Graph client and the chat service (`tests/unit/terminalApi.test.js`). A Unix socket path must stay under 108 bytes, so the session scratchpad is too long for test sockets. Use a short path such as `/tmp/claude-1000/x.sock`.
+- The live app is signed in to a client's Teams tenant, so the output of `chats`, `chat` and `read` is real, private conversation content. Run them only when needed, with a small `-n`, and never copy message content into commits, docs or logs.
+
 ## Additional Resources
 
 **Local documentation files (read these):**
