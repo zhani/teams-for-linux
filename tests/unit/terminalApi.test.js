@@ -207,3 +207,105 @@ describe('loginDriver', () => {
 		assert.doesNotThrow(() => new Function(`return ${script}`));
 	});
 });
+
+describe('graphShape', () => {
+	const { toGraphMessage, toGraphChat, chatType, eventDetail } = require('../../app/terminalApi/graphShape');
+
+	it('maps reactions, mentions, files and edits from chatsvc properties', () => {
+		const msg = toGraphMessage({
+			id: '10', messagetype: 'RichText/Html', originalarrivaltime: '2026-11-04T10:00:00Z',
+			from: '8:orgid:00000000-0000-0000-0000-00000000000a', imdisplayname: 'A',
+			content: '<p>hi <span itemscope="" itemtype="http://schema.skype.com/Mention" itemid="0">Bo</span></p>',
+			properties: {
+				emotions: [{ key: 'like', users: [{ mri: '8:orgid:00000000-0000-0000-0000-00000000000b', time: 1793700000000 }] }],
+				mentions: JSON.stringify([{ itemid: '0', mri: '8:orgid:00000000-0000-0000-0000-00000000000b', displayName: 'Bo' }]),
+				files: JSON.stringify([{ itemid: 'f1', fileName: 'a.txt', fileInfo: { fileUrl: 'https://x/a.txt' } }]),
+				edittime: '1793700001000',
+			},
+		});
+		assert.equal(msg.body.content, '<p>hi <at id="0">Bo</at></p>');
+		assert.deepEqual(msg.reactions.map((r) => [r.reactionType, r.user.user.id]), [['like', '00000000-0000-0000-0000-00000000000b']]);
+		assert.equal(msg.mentions[0].mentioned.user.displayName, 'Bo');
+		assert.equal(msg.attachments[0].name, 'a.txt');
+		assert.ok(msg.lastEditedDateTime);
+	});
+
+	it('escapes plain-text bodies and hides deleted content', () => {
+		assert.equal(toGraphMessage({ id: '1', messagetype: 'Text', content: 'a<b\nc' }).body.content, 'a&lt;b<br>c');
+		assert.equal(toGraphMessage({ id: '3', messagetype: 'Text', content: 'a\r\nb\rc' }).body.content, 'a<br>b<br>c');
+		assert.equal(toGraphMessage({ id: '4', messagetype: 'RichText/Media_CallRecording', content: '<URIObject/>' }).body.content, '<systemEventMessage/>');
+		const del = toGraphMessage({ id: '2', messagetype: 'RichText/Html', content: 'x', properties: { deletetime: '1793700000000' } });
+		assert.equal(del.body.content, '');
+		assert.equal(del.from, null);
+	});
+
+	it('turns chatsvc reply quotes into Graph messageReference attachments', () => {
+		const msg = toGraphMessage({
+			id: '20', messagetype: 'RichText/Html',
+			content: '<div>\n<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="17"><strong itemprop="mri" itemid="8:orgid:00000000-0000-0000-0000-00000000000c">Cy D</strong><span itemprop="time" itemid="17"></span><p itemprop="preview">It&#39;s &amp; ok</p></blockquote>\nreply</div>',
+		});
+		assert.equal(msg.body.content, '<div>\n<attachment id="17"></attachment>\nreply</div>');
+		const ref = JSON.parse(msg.attachments[0].content);
+		assert.equal(msg.attachments[0].contentType, 'messageReference');
+		assert.deepEqual([ref.messageId, ref.messagePreview, ref.messageSender.user.displayName], ['17', "It's & ok", 'Cy D']);
+	});
+
+	it('maps chatsvc reaction keys to Graph reaction types', () => {
+		const { reactionType } = require('../../app/terminalApi/graphShape');
+		assert.equal(reactionType('heart'), 'heart');
+		assert.equal(reactionType('like'), 'like');
+		assert.equal(reactionType('yes-tone3'), '👍🏽');
+		assert.equal(reactionType('1f44f_clappinghands'), '👏');
+		assert.equal(reactionType('weirdcustom'), 'weirdcustom');
+	});
+
+	it('maps system events to Graph eventDetail types', () => {
+		assert.equal(eventDetail('Event/Call', '<partlist type="ended"><duration>90</duration></partlist>').callDuration, 'PT90S');
+		assert.match(eventDetail('ThreadActivity/AddMember', '<friendlyname>Ann</friendlyname>')['@odata.type'], /membersAdded/);
+		assert.equal(eventDetail('ThreadActivity/MemberJoined', '')['@odata.type'], '#microsoft.graph.memberJoinedEventMessageDetail');
+	});
+
+	it('derives chat type and unread viewpoint', () => {
+		assert.equal(chatType({ id: '19:a_b@unq.gbl.spaces' }), 'oneOnOne');
+		assert.equal(chatType({ id: '19:meeting_x@thread.v2' }), 'meeting');
+		assert.equal(chatType({ id: '19:x@thread.v2', threadProperties: { threadType: 'chat' } }), 'group');
+		const chat = toGraphChat({ id: '19:x@thread.v2', properties: { consumptionhorizon: '1793700000000;1;1' }, lastMessage: { id: '5', messagetype: 'Text', content: 'x', originalarrivaltime: '2026-11-04T10:00:00Z' } });
+		assert.equal(chat.viewpoint.lastMessageReadDateTime, new Date(1793700000000).toISOString());
+		assert.equal(chat.members, undefined);
+	});
+});
+
+describe('graphProxy', () => {
+	const { GraphProxy, matchChatRoute } = require('../../app/terminalApi/graphProxy');
+	const G = 'https://graph.microsoft.com/v1.0';
+
+	it('routes only the chat operations the token cannot do', () => {
+		assert.equal(matchChatRoute('GET', `${G}/me/chats?$top=50`).op, 'listChats');
+		assert.deepEqual(matchChatRoute('GET', `${G}/chats/19%3Aabc%40thread.v2/messages?$top=5`).args, ['19:abc@thread.v2']);
+		assert.equal(matchChatRoute('PATCH', `${G}/chats/c/messages/m`).op, 'editMessage');
+		assert.equal(matchChatRoute('POST', `${G}/chats/c/messages`), null); // send stays on Graph
+		assert.equal(matchChatRoute('POST', `${G}/chats/c/messages/m/setReaction`), null);
+		assert.equal(matchChatRoute('GET', `${G}/teams/t/channels`), null);
+	});
+
+	it('strips skin-tone modifiers that tmux draws as separate wide cells', () => {
+		const { stripSkinTones } = require('../../app/terminalApi/graphProxy');
+		assert.equal(stripSkinTones('{"r":"👍🏽","t":"hi 👋🏿 👨‍💻"}'), '{"r":"👍","t":"hi 👋 👨‍💻"}');
+	});
+
+	it('refuses non-Graph hosts so the token is never sent elsewhere', async () => {
+		let tokenAsked = false;
+		const proxy = new GraphProxy({ acquireToken: async () => { tokenAsked = true; return { success: true, token: 't' }; } }, {});
+		const res = await proxy.handle({ method: 'GET', url: 'https://graph.microsoft.com.evil.example/v1.0/me' });
+		assert.equal(res.status, 400);
+		assert.equal(tokenAsked, false);
+	});
+
+	it('answers chat routes from the chat service in Graph shape', async () => {
+		const chats = { listMessages: async (id, opts) => ({ value: [{ id: 'm1' }], seen: [id, opts.top] }) };
+		const proxy = new GraphProxy({}, chats);
+		const res = await proxy.handle({ method: 'GET', url: `${G}/chats/c1/messages?$top=7` });
+		assert.equal(res.status, 200);
+		assert.deepEqual(JSON.parse(Buffer.from(res.body, 'base64')).seen, ['c1', '7']);
+	});
+});

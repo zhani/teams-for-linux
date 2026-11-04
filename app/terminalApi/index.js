@@ -20,10 +20,12 @@ const { app, webContents } = require("electron");
 const { isLoginUrl } = require("../ssoPasswordPrefill");
 const { ChatServiceClient } = require("./chatService");
 const { buildLoginStepScript } = require("./loginDriver");
+const { GraphProxy } = require("./graphProxy");
 
 const SOCKET_NAME = "teams-for-linux-terminal.sock";
 const MFA_WAIT_MS = 120000;
-const MAX_LINE_BYTES = 1024 * 1024;
+// Large enough for proxied file uploads and pasted images (base64).
+const MAX_LINE_BYTES = 64 * 1024 * 1024;
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const LOGIN_STEP_MS = 1500;
 // A fresh start may still be loading Teams; wait this long for a sign-in
@@ -80,6 +82,7 @@ class TerminalApiServer {
   #config;
   #graph;
   #chats;
+  #proxy;
   #server = null;
   #socketPath;
   #subscribers = new Set();
@@ -96,6 +99,7 @@ class TerminalApiServer {
     // Graph can send chat messages but not read them (no Chat.Read scope),
     // so reads go through the Teams chat service.
     this.#chats = chatService || new ChatServiceClient(graphApiClient);
+    this.#proxy = new GraphProxy(graphApiClient, this.#chats);
     this.#socketPath = socketPath || defaultSocketPath();
   }
 
@@ -305,6 +309,9 @@ class TerminalApiServer {
         return this.#unwrap(await this.#chats.getChats(params.top));
       case "chatMessages":
         return this.#unwrap(await this.#chats.getChatMessages(this.#required(params, "chatId"), params.top));
+      case "graph":
+        // Raw Graph passthrough for the Go TUI; see graphProxy.js.
+        return await this.#proxy.handle(params);
       case "login":
         return await this.#login(params, socket);
       case "screenshot":

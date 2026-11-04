@@ -139,6 +139,30 @@ TEAMS_CLI_SOCKET=/tmp/tfl-test.sock teams-cli login you@example.com
 `/tmp/tfl-test/config.json` needs `graphApi.enabled` and `terminalApi.enabled` set to `true`. The
 server will not start on a socket that another instance is still serving.
 
+## Graph proxy for other clients
+
+The socket method `graph` lets a local client make Microsoft Graph requests without a sign-in
+of its own. The intended client is a fork of [teams-tui-go](https://github.com/nospor/teams-tui-go)
+that sends all of its HTTP traffic over this socket. Send `{method, url, contentType?, range?,
+body?}` with `body` base64-encoded; the reply is `{status, contentType, body}`, also base64.
+
+- Only `https://graph.microsoft.com` URLs are accepted, so the session token never goes anywhere
+  else.
+- The token has no `Chat.Read` or `Chat.ReadWrite`, so `graphProxy.js` answers these requests from
+  the Teams chat service instead, in Graph shape (`graphShape.js`):
+  - list chats (`GET /me/chats`)
+  - get one chat (`GET /chats/{id}`)
+  - read messages (`GET /chats/{id}/messages`), with paging through `$skiptoken`
+  - mark a chat read (`markChatReadForUser`)
+  - edit a message (`PATCH /chats/{id}/messages/{mid}`)
+- Chat-service details are converted to Graph's form: reply quotes become `messageReference`
+  attachments, reaction keys become Graph reaction types, system events get `eventDetail`, and
+  carriage returns are normalised.
+- Everything else, including sending messages, reactions, channels and files, is forwarded to
+  Graph with the session token.
+- Skin-tone modifiers are removed from every JSON response. tmux draws them as separate wide
+  characters, which breaks terminal layouts.
+
 ## Limitations
 
 - **Scopes are fixed by Microsoft.** The token belongs to the Teams first-party client, and some

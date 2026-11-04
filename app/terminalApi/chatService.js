@@ -1,22 +1,35 @@
 // app/terminalApi/chatService.js
 
 /**
- * Read-only client for the Teams chat service (IC3 "chatsvc"), the internal
- * API the Teams web app itself uses for chats.
+ * Client for the Teams chat service (IC3 "chatsvc"), the internal API the
+ * Teams web app itself uses for chats.
  *
- * Why not Graph: the token borrowed from Teams lacks Chat.Read/Chat.ReadBasic,
- * so Graph refuses /me/chats and /chats/{id}/messages. Sending still goes
+ * Why not Graph: the token borrowed from Teams lacks Chat.Read/Chat.ReadBasic/
+ * Chat.ReadWrite, so Graph refuses listing chats, reading chat messages,
+ * marking chats read and editing chat messages. New messages are still sent
  * through Graph (ChatMessage.Send), because ADR-015 found chatsvc sends from
  * outside the Teams client unreliable.
  *
- * Results are normalised to the Graph chat/chatMessage shape so callers can
- * treat both sources alike. This is an undocumented API and may change.
+ * Results are mapped to the Graph chat/chatMessage shape (graphShape.js) so
+ * callers can treat both sources alike. This is an undocumented API and may
+ * change.
  */
+
+const {
+  isChatConversation,
+  isControlMessage,
+  mriToUserId,
+  toGraphChat,
+  toGraphMessage,
+} = require("./graphShape");
 
 const IC3_RESOURCE = "https://ic3.teams.office.com";
 const SKYPE_RESOURCE = "https://api.spaces.skype.com";
 const AUTHZ_URL = "https://teams.microsoft.com/api/authsvc/v1.0/authz";
 const REQUEST_TIMEOUT_MS = 30000;
+const MEMBERS_TTL_MS = 10 * 60 * 1000;
+const MEMBER_FETCH_CONCURRENCY = 8;
+const MESSAGES_VIEW = "msnp24Equivalent|supportsMessageProperties";
 
 // Runs in the Teams page. Finds the chat service base URL from requests Teams
 // has already made, e.g. https://teams.microsoft.com/api/chatsvc/emea.
@@ -37,41 +50,28 @@ function tokenScript(resource) {
   })()`;
 }
 
-/** Extract the AAD object id from an MRI such as ".../contacts/8:orgid:<guid>". Pure. */
-function mriToUserId(mri) {
-  const m = String(mri || "").match(/8:orgid:([0-9a-f-]{36})/i);
-  return m ? m[1].toLowerCase() : null;
-}
+const activityTime = (conv) =>
+  String(conv.lastMessage?.originalarrivaltime || conv.lastMessage?.composetime || "");
 
-/** Whether a chatsvc conversation is a chat (not a channel, system feed, etc.). Pure. */
-function isChatConversation(conv) {
-  const id = conv?.id || "";
-  if (!id.startsWith("19:")) return false; // 48:notifications, 48:calllogs, ...
-  const type = (conv.threadProperties?.threadType || "").toLowerCase();
-  return !["space", "topic"].includes(type); // channels
-}
-
-/** Map a chatsvc message to the Graph chatMessage shape. Pure. */
-function toGraphMessage(msg) {
-  const type = String(msg?.messagetype || "");
-  // RichText/Media_* are meeting recordings and call cards, Event/* and
-  // ThreadActivity/* are membership and call events: none are user text.
-  const isUser = /^(Text|RichText|RichText\/Html)$/i.test(type);
-  return {
-    id: msg?.id,
-    createdDateTime: msg?.originalarrivaltime || msg?.composetime || null,
-    messageType: isUser ? "message" : "systemEventMessage",
-    deletedDateTime: msg?.properties?.deletetime ? new Date(Number(msg.properties.deletetime)).toISOString() : null,
-    from: isUser ? { user: { displayName: msg?.imdisplayname || "unknown", id: mriToUserId(msg?.from) } } : null,
-    body: { contentType: /^RichText/i.test(type) ? "html" : "text", content: msg?.content || "" },
-  };
+async function mapLimited(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 class ChatServiceClient {
   #graph;
   #base = null;
-  #auth = null; // { headers, expiresAt }
-  #titleCache = new Map();
+  #auth = null; // { headers, mode }
+  #membersCache = new Map(); // chatId -> { at, members }
+  #myUserId = null;
 
   constructor(graphApiClient) {
     this.#graph = graphApiClient;
@@ -138,80 +138,148 @@ class ChatServiceClient {
     };
   }
 
-  async #get(pathAndQuery) {
+  /**
+   * Request against the chat service. `pathOrUrl` is a path under the base,
+   * or an absolute URL that must itself be under the base (paging links).
+   */
+  async #request(method, pathOrUrl, body) {
     if (!this.#base) await this.#connect();
-    let res = await this.#fetchJson(`${this.#base}${pathAndQuery}`, { headers: this.#auth.headers });
+    const send = () => {
+      const url = pathOrUrl.startsWith("https://") ? pathOrUrl : `${this.#base}${pathOrUrl}`;
+      if (!url.startsWith(`${this.#base}/`)) throw new Error("Refusing chat service URL outside the service base");
+      return this.#fetchJson(url, {
+        method,
+        headers: { ...this.#auth.headers, ...(body ? { "Content-Type": "application/json" } : {}) },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+    };
+    let res = await send();
     if (res.status === 401 || res.status === 403) {
       // Token expired, or bearer auth not accepted here: reconnect once, using
       // the skypetoken route if bearer was just rejected.
       await this.#connect(this.#auth.mode === "bearer");
-      res = await this.#fetchJson(`${this.#base}${pathAndQuery}`, { headers: this.#auth.headers });
+      res = await send();
     }
     if (!res.ok) {
       const detail = res.data?.message || res.data?.errorCode || "";
-      throw new Error(`Chat service request failed (HTTP ${res.status})${detail ? `: ${detail}` : ""}`);
+      const error = new Error(`Chat service request failed (HTTP ${res.status})${detail ? `: ${detail}` : ""}`);
+      error.status = res.status;
+      throw error;
     }
     return res.data;
   }
 
-  // 1:1 and unnamed group chats have no topic; name them after the other
-  // members, which Graph exposes via ChatMember.Read.
-  async #title(conv, myUserId) {
-    const topic = conv.threadProperties?.topic;
-    if (topic) return topic;
-    if (this.#titleCache.has(conv.id)) return this.#titleCache.get(conv.id);
-    let title = null;
-    const members = await this.#graph.makeRequest(`/chats/${encodeURIComponent(conv.id)}/members`).catch(() => null);
-    if (members?.success) {
-      const others = (members.data?.value || [])
-        .filter((m) => (m.userId || "").toLowerCase() !== myUserId)
-        .map((m) => m.displayName)
-        .filter(Boolean);
-      title = others.join(", ") || null;
-    }
-    title = title || conv.lastMessage?.imdisplayname || "chat";
-    this.#titleCache.set(conv.id, title);
-    return title;
-  }
-
-  async #myUserId() {
-    if (this.myUserId) return this.myUserId;
+  async myUserId() {
+    if (this.#myUserId) return this.#myUserId;
     const me = await this.#graph.makeRequest("/me?$select=id");
-    this.myUserId = me?.success ? String(me.data?.id || "").toLowerCase() : null;
-    return this.myUserId;
+    this.#myUserId = me?.success ? String(me.data?.id || "").toLowerCase() : null;
+    return this.#myUserId;
   }
 
-  /** Recent chats, most recently active first, in the Graph chat shape. */
-  async getChats(top = 30) {
-    const limit = Math.min(Number(top) || 30, 100);
+  /** Graph member list of a chat (ChatMember.Read is in the token), cached. */
+  async members(chatId) {
+    const hit = this.#membersCache.get(chatId);
+    if (hit && Date.now() - hit.at < MEMBERS_TTL_MS) return hit.members;
+    const result = await this.#graph.makeRequest(`/chats/${encodeURIComponent(chatId)}/members`).catch(() => null);
+    const members = result?.success ? result.data?.value || [] : [];
+    this.#membersCache.set(chatId, { at: Date.now(), members });
+    return members;
+  }
+
+  async #conversations(limit) {
     // Over-fetch: the conversation list also carries channels and system feeds.
-    const data = await this.#get(`/v1/users/ME/conversations?view=msnp24Equivalent&pageSize=${Math.min(limit * 3, 200)}`);
-    const myUserId = await this.#myUserId();
-    const chats = (data?.conversations || [])
+    const data = await this.#request("GET", `/v1/users/ME/conversations?view=msnp24Equivalent&pageSize=${Math.min(limit * 3, 300)}`);
+    return (data?.conversations || [])
       .filter(isChatConversation)
       .filter((c) => c.lastMessage?.id)
-      .sort((a, b) => String(b.lastMessage.originalarrivaltime || b.lastMessage.composetime || "")
-        .localeCompare(String(a.lastMessage.originalarrivaltime || a.lastMessage.composetime || "")))
+      .sort((a, b) => activityTime(b).localeCompare(activityTime(a)))
       .slice(0, limit);
+  }
+
+  // --- Graph-shaped operations, used by the Graph proxy (graphProxy.js) ---
+
+  /** GET /me/chats: most recently active chats, optionally with members. */
+  async listChats({ top = 50, expandMembers = false } = {}) {
+    const convs = await this.#conversations(Math.min(Number(top) || 50, 100));
+    const members = expandMembers
+      ? await mapLimited(convs, MEMBER_FETCH_CONCURRENCY, (c) => this.members(c.id))
+      : [];
+    return { value: convs.map((c, i) => toGraphChat(c, expandMembers ? members[i] : undefined)) };
+  }
+
+  /** GET /chats/{id} */
+  async getChat(chatId, { expandMembers = false } = {}) {
+    const conv = await this.#request("GET", `/v1/users/ME/conversations/${encodeURIComponent(chatId)}?view=msnp24Equivalent`);
+    return toGraphChat(conv, expandMembers ? await this.members(chatId) : undefined);
+  }
+
+  /**
+   * GET /chats/{id}/messages, newest first. Paging follows chatsvc's
+   * backwardLink, carried opaquely in Graph's $skiptoken.
+   */
+  async listMessages(chatId, { top = 50, skipToken = null } = {}) {
+    const size = Math.min(Number(top) || 50, 200);
+    const path = skipToken
+      ? Buffer.from(skipToken, "base64url").toString("utf8")
+      : `/v1/users/ME/conversations/${encodeURIComponent(chatId)}/messages?view=${MESSAGES_VIEW}&pageSize=${size}&startTime=1`;
+    const data = await this.#request("GET", path);
+    const messages = data?.messages || [];
+    const value = messages.filter((m) => !isControlMessage(m)).map(toGraphMessage);
+    const back = data?._metadata?.backwardLink;
+    const result = { value };
+    if (back && messages.length) {
+      result["@odata.nextLink"] =
+        `https://graph.microsoft.com/v1.0/chats/${encodeURIComponent(chatId)}/messages?$skiptoken=${Buffer.from(back).toString("base64url")}`;
+    }
+    return result;
+  }
+
+  /** POST /chats/{id}/markChatReadForUser: move the read horizon to the latest message. */
+  async markRead(chatId) {
+    const conv = await this.#request("GET", `/v1/users/ME/conversations/${encodeURIComponent(chatId)}?view=msnp24Equivalent`);
+    const last = conv?.lastMessage;
+    if (!last?.id) return;
+    const horizon = `${last.id};${Date.now()};${last.clientmessageid || last.id}`;
+    await this.#request(
+      "PUT",
+      `/v1/users/ME/conversations/${encodeURIComponent(chatId)}/properties?name=consumptionhorizon`,
+      { consumptionhorizon: horizon }
+    );
+  }
+
+  /** PATCH /chats/{id}/messages/{mid}: replace a message's HTML body. */
+  async editMessage(chatId, messageId, html) {
+    await this.#request(
+      "PUT",
+      `/v1/users/ME/conversations/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`,
+      { content: html, messagetype: "RichText/Html", contenttype: "text" }
+    );
+  }
+
+  // --- CLI helpers (cli.js `chats` / `chat`): titles computed server-side ---
+
+  /** Recent chats with a human title in `topic`, most recently active first. */
+  async getChats(top = 30) {
+    const convs = await this.#conversations(Math.min(Number(top) || 30, 100));
+    const me = await this.myUserId();
     const value = [];
-    for (const conv of chats) {
-      value.push({
-        id: conv.id,
-        topic: await this.#title(conv, myUserId),
-        chatType: conv.threadProperties?.threadType || "oneOnOne",
-        lastMessagePreview: toGraphMessage(conv.lastMessage),
-      });
+    for (const conv of convs) {
+      const chat = toGraphChat(conv);
+      if (!chat.topic) {
+        const others = (await this.members(conv.id))
+          .filter((m) => (m.userId || "").toLowerCase() !== me)
+          .map((m) => m.displayName)
+          .filter(Boolean);
+        chat.topic = others.join(", ") || conv.lastMessage?.imdisplayname || "chat";
+      }
+      value.push(chat);
     }
     return { success: true, data: { value } };
   }
 
-  /** Recent messages of a chat, newest first, in the Graph chatMessage shape. */
+  /** Recent messages of a chat, newest first. */
   async getChatMessages(chatId, top = 20) {
-    const size = Math.min(Number(top) || 20, 200);
-    const data = await this.#get(
-      `/v1/users/ME/conversations/${encodeURIComponent(chatId)}/messages?view=msnp24Equivalent|supportsMessageProperties&pageSize=${size}&startTime=1`
-    );
-    return { success: true, data: { value: (data?.messages || []).map(toGraphMessage) } };
+    return { success: true, data: await this.listMessages(chatId, { top }) };
   }
 }
 
