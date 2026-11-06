@@ -158,6 +158,7 @@ function askHidden(question) {
 
 const LOGIN_MESSAGES = {
   "waiting-for-sign-in-page": "Waiting for the sign-in page...",
+  "resetting-session": "Session expired: clearing the cached Teams sign-in to show the sign-in page...",
   "email-submitted": "Email entered.",
   "password-submitted": "Password entered.",
   "account-picked": "Account selected.",

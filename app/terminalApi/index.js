@@ -337,7 +337,9 @@ class TerminalApiServer {
     const password = params.password || null;
     const prefillPassword = !!this.#config.auth?.webLogin?.passwordCommand;
     const started = Date.now();
+    let waitStarted = started;
     let sawLogin = false;
+    let resetDone = false;
     let last = null;
     const progress = (step) => {
       const key = JSON.stringify(step);
@@ -350,7 +352,17 @@ class TerminalApiServer {
         const wc = [...this.#loginContents.values()].find((w) => !w.isDestroyed());
         if (!wc) {
           if (sawLogin) return { signedIn: true };
-          if (Date.now() - started > LOGIN_APPEAR_MS) return { signedIn: true, alreadySignedIn: true };
+          if (Date.now() - waitStarted > LOGIN_APPEAR_MS) {
+            if ((await this.#graph.getTokenInfo())?.success) return { signedIn: true, alreadySignedIn: true };
+            // An expired cached account makes Teams fail silent SSO and stay put
+            // instead of redirecting, so drop its auth cache to force the sign-in page.
+            if (resetDone) throw new Error("Session expired, but no sign-in page appeared after clearing the cache");
+            resetDone = true;
+            progress({ state: "resetting-session" });
+            await this.#resetTeamsSession();
+            waitStarted = Date.now();
+            continue;
+          }
           progress({ state: "waiting-for-sign-in-page" });
           await sleep(LOGIN_STEP_MS);
           continue;
@@ -382,6 +394,18 @@ class TerminalApiServer {
     } finally {
       this.#loginRunning = false;
     }
+  }
+
+  async #resetTeamsSession() {
+    const wc = this.#graph.mainWindow?.webContents;
+    if (!wc || wc.isDestroyed()) throw new Error("Teams window is not available");
+    const origin = new URL(wc.getURL()).origin;
+    console.info("[TERMINAL_API] Clearing Teams auth cache to force sign-in");
+    await wc.session.clearStorageData({
+      origin,
+      storages: ["localstorage", "indexdb", "serviceworkers", "cachestorage"],
+    });
+    wc.reload();
   }
 
   /** PNG of the sign-in window if one is open, else the main window. */
